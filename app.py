@@ -1,22 +1,18 @@
 """
 Biomarker Extraction Streamlit App
-Uses Qwen3.5-0.8B with LoRA adapter from HuggingFace
+Uses Qwen3.5-0.8B merged model via HuggingFace Inference API
 
-NOTE: This app uses standard transformers (NOT Unsloth) for compatibility
-with Streamlit Cloud's CPU environment. For GPU acceleration, use a
-different deployment target (e.g., RunPod, Modal, etc.)
+This app makes API calls to HuggingFace's inference endpoint.
+No local model loading - everything runs remotely.
 """
 
 import streamlit as st
-import torch
 import json
 import re
-from typing import Optional, Dict, List, Any
+from huggingface_hub import InferenceClient
 
 # Constants
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-ADAPTER_NAME = "Shubh-0789/biomarker-qwen3.5-0.8b-lora-v2"
-MAX_SEQ_LENGTH = 2048
+MODEL_NAME = "biolytai123/biomarker-qwen3.5-0.8b-merged-v2"
 
 # System prompt for biomarker extraction
 SYSTEM_PROMPT = """You are a biomedical expert specializing in biomarker extraction. 
@@ -37,61 +33,7 @@ EXAMPLE_TEXTS = [
 ]
 
 
-@st.cache_resource
-def load_model():
-    """Load the Qwen3.5-0.8B model with LoRA adapter using standard transformers."""
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-        from peft import PeftModel
-        
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        
-        # Ensure pad token is set
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        # Load base model - use bfloat16 if available, else float16, else float32
-        try:
-            torch_dtype = torch.bfloat16
-        except Exception:
-            try:
-                torch_dtype = torch.float16
-            except Exception:
-                torch_dtype = torch.float32
-        
-        # Load base model with appropriate dtype
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch_dtype,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-        )
-        
-        # Load and apply LoRA adapter using PeftModel.from_pretrained
-        model = PeftModel.from_pretrained(model, ADAPTER_NAME)
-        
-        # Set to evaluation mode
-        model.eval()
-        
-        return model, tokenizer
-        
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None
-
-
-def format_prompt(text: str) -> str:
-    """Format the input text as a prompt for biomarker extraction using chat template."""
-    return f"""<|im_start|>system
-{SYSTEM_PROMPT}<|im_end|>
-<|im_start|>user
-Extract biomarkers from this clinical text: {text}<|im_end|>
-<|im_start|>assistant
-"""
-
-
-def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
+def extract_json_from_response(response: str) -> dict:
     """Extract JSON from model response, handling various formats."""
     # Try direct JSON parsing first
     try:
@@ -125,55 +67,46 @@ def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def run_inference(text: str, model, tokenizer) -> Optional[Dict[str, Any]]:
-    """Run inference on the input text."""
-    if model is None or tokenizer is None:
-        return None
+def run_inference(text: str, hf_token: str) -> dict:
+    """Run inference via HuggingFace Inference API."""
+    client = InferenceClient(model=MODEL_NAME, token=hf_token)
+    
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Extract biomarkers from this clinical text: {text}"}
+    ]
     
     try:
-        # Format prompt
-        prompt = format_prompt(text)
+        response = client.chat_completion(
+            messages,
+            max_tokens=512,
+            temperature=0.1,
+        )
         
-        # Tokenize input
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LENGTH)
+        # Extract the response text
+        if hasattr(response, 'choices') and response.choices:
+            response_text = response.choices[0].message.content
+        elif isinstance(response, dict) and 'choices' in response:
+            response_text = response['choices'][0]['message']['content']
+        else:
+            response_text = str(response)
         
-        # Move to same device as model
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Generate response
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.1,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        
-        # Decode response
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the assistant's response (after the prompt)
-        assistant_marker = "<|im_start|>assistant\n"
-        if assistant_marker in response:
-            response = response.split(assistant_marker)[-1]
-        
-        # Extract JSON from response
-        result = extract_json_from_response(response)
-        
-        return result
+        # Parse JSON from response
+        result = extract_json_from_response(response_text)
+        return result if result else {"raw": response_text}
         
     except Exception as e:
-        st.error(f"Inference error: {str(e)}")
-        return None
+        return {"error": str(e)}
 
 
-def display_results(results: Dict[str, Any]):
+def display_results(results: dict):
     """Display the extracted biomarkers in a nice format."""
     if not results:
         st.warning("No biomarkers could be extracted from the text.")
+        return
+    
+    if "error" in results:
+        st.error(f"Error: {results['error']}")
         return
     
     # Create columns for different entity types
@@ -225,23 +158,26 @@ def main():
     st.markdown("""
     Extract biomarkers, medical entities, and clinical measurements from biomedical text 
     using the Qwen3.5-0.8B model fine-tuned for biomarker extraction.
+    
+    **Note:** This app uses HuggingFace Inference API — no local model needed!
     """)
+    
+    # Input for HF token
+    st.sidebar.header("⚙️ Configuration")
+    hf_token = st.sidebar.text_input(
+        "HuggingFace Token",
+        type="password",
+        help="Your HF token for inference. Get it from https://huggingface.co/settings/tokens"
+    )
+    
+    if not hf_token:
+        st.info("👈 Please enter your HuggingFace token in the sidebar to start!")
+        st.stop()
     
     # Initialize session state
     if "input_text" not in st.session_state:
         st.session_state["input_text"] = ""
     
-    # Load model
-    with st.spinner("Loading model... This may take a few minutes on first run."):
-        model, tokenizer = load_model()
-    
-    if model is None:
-        st.error("Failed to load model. Please check your internet connection and try again.")
-        st.stop()
-    
-    st.success("✅ Model loaded successfully!")
-    
-    # Input section
     st.divider()
     
     # Example texts dropdown
@@ -275,8 +211,8 @@ def main():
     
     # Run inference
     if run_button and input_text.strip():
-        with st.spinner("Extracting biomarkers..."):
-            results = run_inference(input_text, model, tokenizer)
+        with st.spinner("Extracting biomarkers via HuggingFace API..."):
+            results = run_inference(input_text, hf_token)
         
         if results:
             st.divider()
@@ -296,8 +232,8 @@ def main():
     st.divider()
     st.markdown("""
     <div style="text-align: center; color: gray; font-size: 0.8em;">
-        <p>Model: Qwen3.5-0.8B with LoRA adapter | Fine-tuned for biomarker extraction</p>
-        <p>Powered by Unsloth | Deployed on Streamlit Cloud</p>
+        <p>Model: Qwen3.5-0.8B merged with LoRA adapter | Hosted on HuggingFace Inference API</p>
+        <p>Deployed on Streamlit Cloud</p>
     </div>
     """, unsafe_allow_html=True)
 
