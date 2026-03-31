@@ -1,6 +1,10 @@
 """
 Biomarker Extraction Streamlit App
 Uses Qwen3.5-0.8B with LoRA adapter from HuggingFace
+
+NOTE: This app uses standard transformers (NOT Unsloth) for compatibility
+with Streamlit Cloud's CPU environment. For GPU acceleration, use a
+different deployment target (e.g., RunPod, Modal, etc.)
 """
 
 import streamlit as st
@@ -8,14 +12,6 @@ import torch
 import json
 import re
 from typing import Optional, Dict, List, Any
-
-# Try to import unsloth, fall back to standard transformers if not available
-UNSLOTH_AVAILABLE = False
-try:
-    from unsloth import FastLanguageModel
-    UNSLOTH_AVAILABLE = True
-except ImportError:
-    pass
 
 # Constants
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
@@ -43,48 +39,41 @@ EXAMPLE_TEXTS = [
 
 @st.cache_resource
 def load_model():
-    """Load the Qwen3.5-0.8B model with LoRA adapter."""
+    """Load the Qwen3.5-0.8B model with LoRA adapter using standard transformers."""
     try:
-        if UNSLOTH_AVAILABLE:
-            # Use Unsloth for efficient loading with bf16 (NOT 4-bit)
-            # First load the base model
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=MODEL_NAME,
-                max_seq_length=MAX_SEQ_LENGTH,
-                load_in_4bit=False,  # IMPORTANT: No 4-bit for Qwen3.5
-                load_in_16bit=True,  # Use bf16 loading
-                device_map="auto",
-            )
-            
-            # Load the LoRA adapter using PeftModel.from_pretrained
-            # This properly loads the adapter weights on top of the base model
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, ADAPTER_NAME)
-            
-            # Enable inference mode for Unsloth
-            FastLanguageModel.for_inference(model)
-            
-        else:
-            # Fallback to standard transformers with bf16
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-            from peft import PeftModel
-            
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-            
-            # Load base model in bf16 (NOT 4-bit)
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_NAME,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-            )
-            
-            # Load and apply LoRA adapter using PeftModel.from_pretrained
-            model = PeftModel.from_pretrained(model, ADAPTER_NAME)
-            
-            # Set to evaluation mode
-            model.eval()
-            
+        from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+        from peft import PeftModel
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        
+        # Ensure pad token is set
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load base model - use bfloat16 if available, else float16, else float32
+        try:
+            torch_dtype = torch.bfloat16
+        except Exception:
+            try:
+                torch_dtype = torch.float16
+            except Exception:
+                torch_dtype = torch.float32
+        
+        # Load base model with appropriate dtype
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+        
+        # Load and apply LoRA adapter using PeftModel.from_pretrained
+        model = PeftModel.from_pretrained(model, ADAPTER_NAME)
+        
+        # Set to evaluation mode
+        model.eval()
+        
         return model, tokenizer
         
     except Exception as e:
